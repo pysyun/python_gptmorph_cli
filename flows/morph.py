@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import copy
+import time
 import asyncio
 import pkg_resources
 
@@ -79,9 +80,52 @@ class MorphBot(ConsoleBot):
         # documentation/parallel-generate-scheduling.md.
         self.scheduler = JobScheduler(self.registry.ids)
 
+        # Last health probe per processor id: ``(ProcessorHealth, monotonic time)``.
+        # Probes are reused for HEALTH_TTL seconds so back-to-back commands
+        # don't re-probe every server.
+        self.health = {}
+
         # The welcome banner is only shown once, on the very first /start;
         # later returns to the main menu show just the menu.
         self.shown_welcome = False
+
+    # -- processor availability -------------------------------------------
+
+    HEALTH_TTL = 15.0
+
+    async def refresh_health(self, processor_ids=None, force=False):
+        """Probe ``processor_ids`` (default: all) concurrently, unless a fresh
+        enough probe is cached, and push the results into the scheduler so
+        round-robin dispatch skips processors that are down or unusable."""
+        ids = self.registry.ids if processor_ids is None else processor_ids
+        now = time.monotonic()
+        stale = [pid for pid in ids
+                 if force or pid not in self.health or now - self.health[pid][1] > self.HEALTH_TTL]
+        if stale:
+            loop = asyncio.get_event_loop()
+            results = await asyncio.gather(
+                *[loop.run_in_executor(None, self.registry.check, pid) for pid in stale])
+            for pid, health in zip(stale, results):
+                self.health[pid] = (health, time.monotonic())
+                self.scheduler.set_available(pid, health.usable)
+        return {pid: self.health[pid][0] for pid in ids}
+
+    async def describe_available_models(self):
+        """List the models of the processors that are online right now, for
+        the welcome banner."""
+        if not len(self.registry):
+            return "No processors configured. See \"/settings\".\n"
+
+        health = await self.refresh_health()
+        available = [pid for pid in self.registry.ids if health[pid].usable]
+        if not available:
+            return f"No models available: all {len(self.registry)} processor(s) are offline " \
+                   f"or unusable. See \"/settings\".\n"
+
+        text = f"Available models ({len(available)} of {len(self.registry)} processors):\n"
+        for pid in available:
+            text += f"    @{pid}: {self.registry.get(pid).model_name()}\n"
+        return text
 
     # -- processor selection ----------------------------------------------
 
@@ -199,6 +243,7 @@ class MorphBot(ConsoleBot):
                     response = results.get(processor_id)
                     print(f"llm[{processor_id}]> {response}")
                     if response is None:
+                        self.health.pop(processor_id, None)
                         continue
                     out_name = self.output_file_name(file_name, processor_id, multi)
                     body, mode = self.response_to_file_body(response, append_if_plain)
@@ -236,13 +281,13 @@ class MorphBot(ConsoleBot):
         except KeyError:
             return default
 
-    def intake_job(self, action):
+    async def intake_job(self, action):
         """Parse the processor spec for a `/generate` or `/patch` command,
         reserve its slot or queue position on the scheduler right away, and
         return the status line to show the user. The processor(s) this job
         will actually run on are decided here -- before the file name or
-        prompt are even collected. See
-        documentation/parallel-generate-scheduling.md."""
+        prompt are even collected. Processors that are down or unusable are
+        never assigned. See documentation/parallel-generate-scheduling.md."""
         spec = self.parse_processor_spec(action.get("text"))
 
         if spec:
@@ -250,11 +295,22 @@ class MorphBot(ConsoleBot):
             if not pinned_ids:
                 action["context"].add("job", None)
                 return "mrph> No matching processor. Please, configure one as stated in \"/settings\"."
+            health = await self.refresh_health(pinned_ids)
+            down = [pid for pid in pinned_ids if not health[pid].usable]
+            if down:
+                action["context"].add("job", None)
+                details = "; ".join(f"{pid}: {health[pid].describe()}" for pid in down)
+                return f"mrph> Processor(s) not available -- {details}. See \"/settings\"."
         else:
             pinned_ids = None
             if not self.registry.ids:
                 action["context"].add("job", None)
                 return "mrph> No matching processor. Please, configure one as stated in \"/settings\"."
+            await self.refresh_health()
+            if not self.scheduler.available_ids():
+                action["context"].add("job", None)
+                return "mrph> No processor is available right now (all are offline or unusable). " \
+                       "See \"/settings\" for details."
 
         job = self.scheduler.submit(pinned_ids)
         action["context"].add("job", job)
@@ -278,8 +334,9 @@ class MorphBot(ConsoleBot):
             pins = ", ".join(job.pinned_ids)
             return f"mrph> [job {job.id}] Processor(s) \"{pins}\" busy. " \
                    f"Queued at position {position} for {pins}."
-        pool_desc = ", ".join(self.scheduler.pool)
-        return f"mrph> [job {job.id}] All {pool_size} processors busy ({pool_desc}). " \
+        available = self.scheduler.available_ids()
+        pool_desc = ", ".join(available)
+        return f"mrph> [job {job.id}] All {len(available)} available processors busy ({pool_desc}). " \
                f"Queued at position {position} -- will run on whichever processor frees first."
 
     def build_settings_transition(self):
@@ -289,12 +346,16 @@ class MorphBot(ConsoleBot):
             text = "mrph>\n"
 
             if len(self.registry):
+                health = await self.refresh_health(force=True)
                 default_id = self.registry.default_id()
                 text += f"Configured processors ({len(self.registry)}), " \
                         f"default is \"{default_id}\":\n\n"
                 for identifier, description in zip(self.registry.ids, self.registry.describe_all()):
                     status = self.scheduler.describe_status(identifier)
-                    text += f"    {description} -- {status}\n"
+                    text += f"    {description}\n" \
+                            f"        {health[identifier].describe()} -- {status}\n"
+                usable = len(self.scheduler.available_ids())
+                text += f"\n{usable} of {len(self.registry)} processor(s) available.\n"
                 queued = self.scheduler.queue_length()
                 if queued:
                     text += f"\n{queued} job(s) waiting for a free processor.\n"
@@ -358,7 +419,7 @@ Choosing processors (multi-agent):
 
 Queuing: fire off several /generate calls back to back -- one per file -- and
 each is picked up by whichever processor is free, queuing automatically once
-every slot is busy. /settings shows what is idle, busy or queued.
+every slot is busy. /settings shows what is online, idle, busy or queued.
             '''
 
             await action["context"].bot.send_message(chat_id=action["update"]["effective_chat"]["id"], text=text)
@@ -370,7 +431,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
         async def transition(action):
 
             # Decides this job's processor(s)/queue position right away.
-            status = self.intake_job(action)
+            status = await self.intake_job(action)
             job = self.context_get(action, "job")
 
             text = status
@@ -385,7 +446,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
 
         async def transition(action):
 
-            status = self.intake_job(action)
+            status = await self.intake_job(action)
             job = self.context_get(action, "job")
 
             text = status
@@ -582,8 +643,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
     def build_state_machine(self, builder):
         menu_items = [["Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph", "Version"]]
 
-        welcome_transition = self.build_menu_response_transition(
-            r'''┌────────────────────────────────────────────────────────────────────────────┐
+        logo = r'''┌────────────────────────────────────────────────────────────────────────────┐
 │ GPT Morph :: GRANDPA v1.0.55          THE GRANDPA OF CLAUDE CODE           │
 ├────────────────────────────────────────────────────────────────────────────┤
 │      .----------------.          > HOW CAN I HELP YOU, KIDDO?              │
@@ -597,8 +657,7 @@ every slot is busy. /settings shows what is idle, busy or queued.
 ├────────────────────────────────────────────────────────────────────────────┤
 │ "WE DEBUGGED WITH PRINT STATEMENTS."                                       │
 └────────────────────────────────────────────────────────────────────────────┘
-''',
-            menu_items)
+'''
         short_menu_transition = self.build_menu_response_transition("mrph> Main menu:", menu_items)
 
         async def main_menu_transition(action):
@@ -606,7 +665,8 @@ every slot is busy. /settings shows what is idle, busy or queued.
                 await short_menu_transition(action)
             else:
                 self.shown_welcome = True
-                await welcome_transition(action)
+                text = logo + await self.describe_available_models()
+                await self.build_menu_response_transition(text, menu_items)(action)
 
         return builder \
             .edge(

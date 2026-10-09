@@ -228,6 +228,33 @@ onto `flows/morph.py` and `scheduler.py` as follows:
 - `/patch` follows the same pool/queue/rotation rules as `/generate`, since
   it goes through the same `morph_and_save` finisher today.
 
+## Processor availability (health checks)
+
+A free slot is only useful if its server is actually up. Before a job is
+taken in (`MorphBot.intake_job`), `MorphBot.refresh_health` probes the
+processors with `ProcessorRegistry.check` (`GET /models` for llama.cpp and
+OpenAI-compatible servers, `ollama list` for Ollama; 3 s timeout, no retries)
+and records one of three states:
+
+- **online**: reachable and serving the configured model, so it can take jobs.
+- **unusable**: reachable, but the configured model is not served (or there are
+  no credentials).
+- **offline**: not reachable.
+
+Results are cached for 15 s (`MorphBot.HEALTH_TTL`) and pushed into the
+scheduler via `JobScheduler.set_available`:
+
+- Rotation jobs only go to available processors. If none is available, the
+  job is refused instead of queuing forever.
+- A pinned job (`@id`) is refused when any of its processors is not online.
+- A queued rotation job is never handed to a slot whose processor is down.
+  When a processor comes back, it immediately picks up the queue.
+- A processor that fails during a run has its cached probe dropped, so the
+  next intake probes it again.
+
+`/settings` always re-probes every processor and shows its state next to the
+scheduler status, plus how many processors are available.
+
 ## Configuration
 
 No new environment variables are introduced. Pool size is simply

@@ -174,5 +174,47 @@ class LaunchCallbackTests(unittest.TestCase):
         self.assertEqual(calls, [1])
 
 
+class AvailabilityTests(unittest.TestCase):
+
+    def setUp(self):
+        self.scheduler = JobScheduler(["k80-a", "k80-b", "gpt4"])
+
+    def test_rotation_skips_unavailable_processor(self):
+        self.scheduler.set_available("k80-a", False)
+
+        j1 = self.scheduler.submit(None)
+        j2 = self.scheduler.submit(None)
+
+        self.assertEqual(j1.assigned, ["k80-b"])
+        self.assertEqual(j2.assigned, ["gpt4"])
+        self.assertEqual(self.scheduler.available_ids(), ["k80-b", "gpt4"])
+
+    def test_queued_rotation_job_not_offered_to_unavailable_processor(self):
+        j1 = self.scheduler.submit(None)
+        for _ in range(2):
+            self.scheduler.submit(None)
+        queued = self.scheduler.submit(None)
+
+        self.scheduler.set_available("k80-a", False)
+        self.scheduler.release(j1.assigned)
+
+        self.assertIsNone(queued.assigned)
+
+    def test_processor_coming_back_picks_up_queued_job(self):
+        for pid in self.scheduler.pool[1:]:
+            self.scheduler.set_available(pid, False)
+        self.scheduler.submit(None)
+        queued = self.scheduler.submit(None)
+        self.assertIsNone(queued.assigned)
+
+        self.scheduler.set_available("gpt4", True)
+
+        self.assertEqual(queued.assigned, ["gpt4"])
+
+    def test_idle_unavailable_processor_status(self):
+        self.scheduler.set_available("gpt4", False)
+        self.assertEqual(self.scheduler.describe_status("gpt4"), "unavailable")
+
+
 if __name__ == "__main__":
     unittest.main()

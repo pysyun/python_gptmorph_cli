@@ -38,6 +38,8 @@ Two configuration schemes are supported:
 import os
 from typing import Dict, List, Optional
 
+from ollama import Client as OllamaClient
+
 from processors.ollama_processor import OllamaProcessor
 from processors.llama_cpp_processor import LlamaCppProcessor
 from processors.openai_processor import OpenAIProcessor
@@ -54,6 +56,11 @@ class ProcessorConfig:
         self.kind = kind
         self.params = params
 
+    def model_name(self) -> str:
+        if self.kind == "openai":
+            return self.params.get("model") or os.environ.get("OPENAI_MODEL_NAME") or "(default)"
+        return self.params.get("model")
+
     def describe(self) -> str:
         if self.kind == "llama_cpp":
             return f"[{self.identifier}] llama.cpp @ {self.params.get('endpoint_uri')} " \
@@ -66,6 +73,25 @@ class ProcessorConfig:
             return f"[{self.identifier}] OpenAI @ {target} " \
                    f"(model \"{self.params.get('model') or os.environ.get('OPENAI_MODEL_NAME')}\")"
         return f"[{self.identifier}] {self.kind}"
+
+
+class ProcessorHealth:
+    """Result of probing one processor: can jobs be sent to it right now?"""
+
+    ONLINE = "online"        # reachable and serving the configured model
+    UNUSABLE = "unusable"    # reachable, but cannot run jobs (e.g. model missing)
+    OFFLINE = "offline"      # not reachable at all
+
+    def __init__(self, state: str, detail: str = ""):
+        self.state = state
+        self.detail = detail
+
+    @property
+    def usable(self) -> bool:
+        return self.state == self.ONLINE
+
+    def describe(self) -> str:
+        return f"{self.state} ({self.detail})" if self.detail else self.state
 
 
 class ProcessorRegistry:
@@ -105,6 +131,46 @@ class ProcessorRegistry:
                 base_url=config.params.get("base_url"),
             )
         raise ValueError(f"Unknown processor type \"{config.kind}\" for id \"{identifier}\".")
+
+    def check(self, identifier: str, timeout: float = 3.0) -> "ProcessorHealth":
+        """Probe ``identifier`` once: is its server reachable, and does it
+        actually serve the configured model? Blocking; never raises."""
+        config = self._configs[identifier]
+        model = config.params.get("model")
+        try:
+            if config.kind == "ollama":
+                served = self._list_ollama_models(config.params["endpoint_uri"], timeout)
+            else:
+                # llama.cpp and OpenAI(-compatible) servers both expose /models.
+                client = self.create(identifier).client
+                if client is None:
+                    return ProcessorHealth(ProcessorHealth.UNUSABLE, "no OpenAI/Azure credentials")
+                page = client.with_options(timeout=timeout, max_retries=0).models.list()
+                served = [entry.id for entry in page.data]
+        except Exception as error:
+            return ProcessorHealth(ProcessorHealth.OFFLINE, self._short_error(error))
+
+        if model and served and not self._serves(model, served):
+            return ProcessorHealth(ProcessorHealth.UNUSABLE,
+                                   f"model \"{model}\" not served; server has {', '.join(served)}")
+        return ProcessorHealth(ProcessorHealth.ONLINE)
+
+    @staticmethod
+    def _list_ollama_models(uri: str, timeout: float) -> List[str]:
+        response = OllamaClient(host=uri, timeout=timeout).list()
+        models = response["models"] if isinstance(response, dict) else response.models
+        return [m["model"] if isinstance(m, dict) else m.model for m in models]
+
+    @staticmethod
+    def _serves(model: str, served: List[str]) -> bool:
+        # Ollama reports "name:tag"; a bare "name" in .env means "name:latest".
+        return model in served or f"{model}:latest" in served
+
+    @staticmethod
+    def _short_error(error: Exception) -> str:
+        cause = error.__cause__ or error
+        text = str(cause).splitlines()[0] if str(cause) else type(cause).__name__
+        return text[:120]
 
     def run(self, identifier: str, messages: List[Dict[str, str]]) -> str:
         """Run one processor synchronously and return its text response."""

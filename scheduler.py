@@ -47,6 +47,10 @@ class JobScheduler:
         self.pool: List[str] = list(processor_ids)
         self._busy: Dict[str, Optional[Job]] = {pid: None for pid in self.pool}
         self._busy_since: Dict[str, float] = {}
+        # Whether each processor's server was last seen reachable and usable.
+        # Rotation only dispatches to available processors; the caller keeps
+        # this up to date via ``set_available`` (see MorphBot.refresh_health).
+        self._available: Dict[str, bool] = {pid: True for pid in self.pool}
         # Jobs pinned to ``pid`` that are waiting specifically on it, FIFO.
         self._waiters: Dict[str, List[Job]] = {pid: [] for pid in self.pool}
         # Rotation-only jobs waiting for *any* processor to free.
@@ -89,6 +93,22 @@ class JobScheduler:
         job._launch = launch
         self._maybe_launch(job)
 
+    # -- availability ------------------------------------------------------------
+
+    def set_available(self, pid: str, available: bool) -> None:
+        """Mark ``pid`` as (un)reachable. A processor coming back online
+        immediately picks up whatever is queued for it."""
+        was_available = self._available[pid]
+        self._available[pid] = available
+        if available and not was_available and self._busy[pid] is None:
+            self._offer(pid)
+
+    def is_available(self, pid: str) -> bool:
+        return self._available.get(pid, False)
+
+    def available_ids(self) -> List[str]:
+        return [pid for pid in self.pool if self._available[pid]]
+
     # -- status/reporting ------------------------------------------------------
 
     def queue_position(self, job: Job) -> int:
@@ -118,7 +138,8 @@ class JobScheduler:
         job = self._busy.get(pid)
         waiting = len(self._waiters.get(pid, []))
         if job is None:
-            return f"idle ({waiting} waiting)" if waiting else "idle"
+            idle = "idle" if self._available.get(pid, False) else "unavailable"
+            return f"{idle} ({waiting} waiting)" if waiting else idle
         elapsed = int(time.monotonic() - self._busy_since[pid])
         return f"running job {job.id} for {elapsed}s ({waiting} waiting)" if waiting \
             else f"running job {job.id} for {elapsed}s"
@@ -141,7 +162,7 @@ class JobScheduler:
         if self._waiters[pid]:
             self._try_start_pinned(self._waiters[pid][0])
             return
-        if self._rotation_queue and self._busy[pid] is None:
+        if self._rotation_queue and self._busy[pid] is None and self._available[pid]:
             job = self._rotation_queue.pop(0)
             self._dispatch(job, [pid])
 
@@ -150,7 +171,7 @@ class JobScheduler:
         for step in range(n):
             idx = (self._cursor + step) % n
             pid = self.pool[idx]
-            if self._busy[pid] is None and not self._waiters[pid]:
+            if self._busy[pid] is None and not self._waiters[pid] and self._available[pid]:
                 self._cursor = (idx + 1) % n
                 self._dispatch(job, [pid])
                 return True

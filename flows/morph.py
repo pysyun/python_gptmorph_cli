@@ -644,7 +644,7 @@ every slot is busy. /settings shows what is online, idle, busy or queued.
         menu_items = [["Generate", "Patch"], ["Settings", "Help", "Exit"], ["Graph", "Version"]]
 
         logo = r'''┌────────────────────────────────────────────────────────────────────────────┐
-│ GPT Morph :: GRANDPA v1.0.55          THE GRANDPA OF CLAUDE CODE           │
+│ GPT Morph :: GRANDPA v1.0.56          THE GRANDPA OF CLAUDE CODE           │
 ├────────────────────────────────────────────────────────────────────────────┤
 │      .----------------.          > HOW CAN I HELP YOU, KIDDO?              │
 │     /   _        _     \                                                   │
